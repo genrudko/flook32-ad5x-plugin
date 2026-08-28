@@ -96,6 +96,16 @@ class LifecycleTests(unittest.TestCase):
         exclude = self.root / ".git" / "info" / "exclude"
         self.assertIn("/klippy/extras/flook32.py", exclude.read_text())
 
+    def test_install_accepts_existing_symlink_to_same_inode_alias(self):
+        dest = self.root / "klippy" / "extras" / "flook32.py"
+        with tempfile.TemporaryDirectory(dir=PKG) as same_fs_dir:
+            alias = pathlib.Path(same_fs_dir) / "flook32-alias.py"
+            os.link(PKG / "flook32.py", alias)
+            dest.symlink_to(alias)
+            result = run_script("install.sh", self.env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(dest.is_symlink())
+
     def test_install_refuses_foreign_module_and_rolls_back_include(self):
         dest = self.root / "klippy" / "extras" / "flook32.py"
         dest.write_text("foreign\n", encoding="utf-8")

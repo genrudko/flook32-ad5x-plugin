@@ -88,15 +88,20 @@ flook32_remove_git_exclude() {
     mv "$exclude.tmp" "$exclude"
 }
 
+flook32_same_file() {
+    left="$1"; right="$2"
+    [ -e "$left" ] && [ -e "$right" ] || return 1
+    [ "$left" -ef "$right" ] 2>/dev/null
+}
+
 flook32_link_runtime() {
     root="$(flook32_detect_klipper_root)" || {
         echo 'ERROR: active Klipper repository not found' >&2
         return 1
     }
     dest="$root/klippy/extras/flook32.py"
-    src_real="$(readlink -f "$FLOOK32_SRC")"
     if [ -L "$dest" ]; then
-        if [ "$(readlink -f "$dest" 2>/dev/null || true)" != "$src_real" ]; then
+        if ! flook32_same_file "$dest" "$FLOOK32_SRC"; then
             echo "ERROR: foreign symlink already owns $dest -> $(readlink "$dest" 2>/dev/null || true)" >&2
             return 1
         fi
@@ -111,14 +116,13 @@ flook32_link_runtime() {
 }
 
 flook32_remove_owned_links() {
-    src_real="$(readlink -f "$FLOOK32_SRC" 2>/dev/null || printf '%s' "$FLOOK32_SRC")"
     seen=''
     flook32_known_klipper_roots | while IFS= read -r root; do
         [ -n "$root" ] || continue
         case " $seen " in *" $root "*) continue ;; esac
         seen="$seen $root"
         dest="$root/klippy/extras/flook32.py"
-        if [ -L "$dest" ] && [ "$(readlink -f "$dest" 2>/dev/null || true)" = "$src_real" ]; then
+        if [ -L "$dest" ] && flook32_same_file "$dest" "$FLOOK32_SRC"; then
             rm -f "$dest"
             flook32_remove_git_exclude "$root"
         elif [ ! -e "$dest" ] && [ ! -L "$dest" ]; then

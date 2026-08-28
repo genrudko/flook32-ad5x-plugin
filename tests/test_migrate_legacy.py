@@ -35,7 +35,8 @@ class LegacyMigrationTests(unittest.TestCase):
             "target=\"$FLOOK32_OLD_DIR\"\n"
             "mkdir -p \"$target/.git\"\n"
             "cp \"$FLOOK32_TEST_PACKAGE/flook32.py\" \"$target/flook32.py\"\n"
-            "cp \"$FLOOK32_TEST_PACKAGE/flook32.cfg\" \"$target/flook32.cfg\"\n",
+            "cp \"$FLOOK32_TEST_PACKAGE/flook32.cfg\" \"$target/flook32.cfg\"\n"
+            "printf '%s\\n' '[include plugins/flook32/flook32.cfg]' > \"$FLOOK32_MOD_DATA/plugins.cfg\"\n",
             encoding="utf-8",
         )
         self.driver.chmod(0o755)
@@ -76,6 +77,47 @@ class LegacyMigrationTests(unittest.TestCase):
         self.assertIn("[update_manager flook32]", moon)
         self.assertIn("flook32-ad5x-plugin.git", moon)
         self.assertIn("channel: dev", moon)
+
+    def test_zero_driver_without_enabled_include_rolls_back(self):
+        self.driver.write_text(
+            "#!/bin/sh\n"
+            "set -eu\n"
+            "target=\"$FLOOK32_OLD_DIR\"\n"
+            "mkdir -p \"$target/.git\"\n"
+            "cp \"$FLOOK32_TEST_PACKAGE/flook32.py\" \"$target/flook32.py\"\n"
+            "cp \"$FLOOK32_TEST_PACKAGE/flook32.cfg\" \"$target/flook32.cfg\"\n"
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        self.driver.chmod(0o755)
+        before_user = (self.mod / "user.cfg").read_text()
+        result = subprocess.run(
+            ["/bin/sh", str(PKG / "migrate_legacy.sh")],
+            env=self.env(), text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("include is not enabled", result.stderr)
+        self.assertEqual((self.old / "flook32.py").read_text(), "legacy\n")
+        self.assertEqual((self.mod / "user.cfg").read_text(), before_user)
+
+    def test_partial_adoption_is_repaired(self):
+        subprocess.run(["git", "init", "-q", str(self.old)], check=True)
+        subprocess.run(
+            ["git", "-C", str(self.old), "remote", "add", "origin",
+             "https://github.com/genrudko/flook32-ad5x-plugin.git"],
+            check=True,
+        )
+        result = subprocess.run(
+            ["/bin/sh", str(PKG / "migrate_legacy.sh")],
+            env=self.env(), text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("repairing lifecycle state", result.stdout)
+        self.assertIn(
+            "[include plugins/flook32/flook32.cfg]",
+            (self.mod / "plugins.cfg").read_text(),
+        )
+        self.assertFalse((self.mod / "legacy-backup").exists())
 
     def test_failed_driver_rolls_back(self):
         self.driver.write_text("#!/bin/sh\nexit 7\n", encoding="utf-8")

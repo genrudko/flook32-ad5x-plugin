@@ -7,6 +7,7 @@ OLD_DIR="${FLOOK32_OLD_DIR:-$MOD_DATA/plugins/flook32}"
 USER_CFG="${FLOOK32_USER_CFG:-$MOD_DATA/user.cfg}"
 POWER_ON="${FLOOK32_POWER_ON:-$MOD_DATA/power_on.sh}"
 MOON_CFG="${FLOOK32_MOON_CFG:-$MOD_DATA/user.moonraker.conf}"
+PLUGINS_CFG="${FLOOK32_PLUGINS_CFG:-$MOD_DATA/plugins.cfg}"
 STASH="${FLOOK32_LEGACY_STASH:-$MOD_DATA/flook32-legacy.cfg}"
 ORIGIN="${FLOOK32_ORIGIN:-https://github.com/genrudko/flook32-ad5x-plugin.git}"
 INCLUDE='[include plugins/flook32/flook32.cfg]'
@@ -14,9 +15,11 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 BACKUP="${FLOOK32_BACKUP_DIR:-$MOD_DATA/flook32-legacy-backup-$STAMP}"
 SNAP="${FLOOK32_MIGRATION_SNAPSHOT:-$MOD_DATA/.flook32-migration-$STAMP}"
 SUCCESS=0
+MOVED_LEGACY=0
+ALREADY_ADOPTED=0
 
 mkdir -p "$SNAP"
-for item in "$USER_CFG" "$POWER_ON" "$MOON_CFG"; do
+for item in "$USER_CFG" "$POWER_ON" "$MOON_CFG" "$PLUGINS_CFG"; do
     key="$(basename "$item")"
     if [ -e "$item" ]; then cp -p "$item" "$SNAP/$key"; else : > "$SNAP/.absent-$key"; fi
 done
@@ -32,11 +35,14 @@ rollback() {
     trap - EXIT HUP INT TERM
     if [ "$SUCCESS" -ne 1 ]; then
         echo 'ERROR: migration failed; restoring legacy FLOOK32 state' >&2
-        rm -rf "$OLD_DIR"
-        [ -d "$BACKUP" ] && mv "$BACKUP" "$OLD_DIR"
+        if [ "$MOVED_LEGACY" -eq 1 ]; then
+            rm -rf "$OLD_DIR"
+            [ -d "$BACKUP" ] && mv "$BACKUP" "$OLD_DIR"
+        fi
         restore_file "$USER_CFG"
         restore_file "$POWER_ON"
         restore_file "$MOON_CFG"
+        restore_file "$PLUGINS_CFG"
     fi
     exit "$rc"
 }
@@ -46,20 +52,21 @@ trap rollback EXIT HUP INT TERM
 if [ -d "$OLD_DIR/.git" ]; then
     current="$(git -C "$OLD_DIR" config --get remote.origin.url 2>/dev/null || true)"
     if [ "$current" = "$ORIGIN" ]; then
-        echo 'FLOOK32 is already adopted by the standalone repository.'
-        SUCCESS=1
-        rm -rf "$SNAP"
-        trap - EXIT HUP INT TERM
-        exit 0
+        ALREADY_ADOPTED=1
+        echo 'FLOOK32 standalone repository already present; repairing lifecycle state.'
+    else
+        echo "ERROR: $OLD_DIR is already a different Git repository" >&2
+        exit 1
     fi
-    echo "ERROR: $OLD_DIR is already a different Git repository" >&2
-    exit 1
 fi
 
-[ -f "$OLD_DIR/flook32.cfg" ] || { echo 'ERROR: legacy flook32.cfg is missing' >&2; exit 1; }
-cp -p "$OLD_DIR/flook32.cfg" "$STASH"
-[ ! -e "$BACKUP" ] || { echo "ERROR: backup already exists: $BACKUP" >&2; exit 1; }
-mv "$OLD_DIR" "$BACKUP"
+if [ "$ALREADY_ADOPTED" -eq 0 ]; then
+    [ -f "$OLD_DIR/flook32.cfg" ] || { echo 'ERROR: legacy flook32.cfg is missing' >&2; exit 1; }
+    cp -p "$OLD_DIR/flook32.cfg" "$STASH"
+    [ ! -e "$BACKUP" ] || { echo "ERROR: backup already exists: $BACKUP" >&2; exit 1; }
+    mv "$OLD_DIR" "$BACKUP"
+    MOVED_LEGACY=1
+fi
 
 # Remove the pre-lifecycle config include while the old directory is parked.
 if [ -f "$USER_CFG" ]; then
@@ -124,6 +131,10 @@ fi
 "$DRIVER" flook32 Enable
 [ -d "$OLD_DIR/.git" ] || { echo 'ERROR: Z-Mod did not clone the standalone plugin' >&2; exit 1; }
 [ -f "$OLD_DIR/flook32.py" ] || { echo 'ERROR: standalone flook32.py missing after enable' >&2; exit 1; }
+if ! grep -qxF "$INCLUDE" "$PLUGINS_CFG" 2>/dev/null; then
+    echo 'ERROR: Z-Mod returned success but FLOOK32 include is not enabled (install hook likely failed)' >&2
+    exit 1
+fi
 
 SUCCESS=1
 trap - EXIT HUP INT TERM
