@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+flook32.local*.cfg
+backups/
+boot.log
+ensure.sh
