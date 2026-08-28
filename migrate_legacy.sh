@@ -50,7 +50,16 @@ trap rollback EXIT HUP INT TERM
 
 [ -d "$OLD_DIR" ] || { echo "ERROR: legacy directory not found: $OLD_DIR" >&2; exit 1; }
 if [ -d "$OLD_DIR/.git" ]; then
-    current="$(git -C "$OLD_DIR" config --get remote.origin.url 2>/dev/null || true)"
+    current="$(awk '
+      /^\[remote "origin"\]$/ {on=1; next}
+      /^\[/ && on {exit}
+      on && /^[[:space:]]*url[[:space:]]*=/ {
+        sub(/^[[:space:]]*url[[:space:]]*=[[:space:]]*/, "")
+        sub(/[[:space:]]+$/, "")
+        print
+        exit
+      }
+    ' "$OLD_DIR/.git/config" 2>/dev/null || true)"
     if [ "$current" = "$ORIGIN" ]; then
         ALREADY_ADOPTED=1
         echo 'FLOOK32 standalone repository already present; repairing lifecycle state.'

@@ -100,6 +100,30 @@ class LegacyMigrationTests(unittest.TestCase):
         self.assertEqual((self.old / "flook32.py").read_text(), "legacy\n")
         self.assertEqual((self.mod / "user.cfg").read_text(), before_user)
 
+    def test_partial_adoption_is_repaired_without_git_in_path(self):
+        subprocess.run(["git", "init", "-q", str(self.old)], check=True)
+        subprocess.run(
+            ["git", "-C", str(self.old), "remote", "add", "origin",
+             "https://github.com/genrudko/flook32-ad5x-plugin.git"],
+            check=True,
+        )
+        env = self.env()
+        # BusyBox/host-like PATH: lifecycle migration must not require git
+        # just to identify the already-adopted repository.
+        fakebin = self.tmp / "fakebin"
+        fakebin.mkdir()
+        for name in ("awk", "basename", "cat", "chmod", "cp", "date", "grep", "mkdir", "mv", "printf", "rm", "sh"):
+            src = shutil.which(name)
+            if src:
+                (fakebin / name).symlink_to(src)
+        env["PATH"] = str(fakebin)
+        result = subprocess.run(
+            ["/bin/sh", str(PKG / "migrate_legacy.sh")],
+            env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("repairing lifecycle state", result.stdout)
+
     def test_partial_adoption_is_repaired(self):
         subprocess.run(["git", "init", "-q", str(self.old)], check=True)
         subprocess.run(
