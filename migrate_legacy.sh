@@ -100,7 +100,7 @@ else
 
 [update_manager flook32]
 type: git_repo
-channel: stable
+channel: dev
 path: /root/printer_data/config/mod_data/plugins/flook32
 origin: $ORIGIN
 is_system_service: False

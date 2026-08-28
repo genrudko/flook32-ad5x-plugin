@@ -75,6 +75,7 @@ class LegacyMigrationTests(unittest.TestCase):
         moon = (self.mod / "user.moonraker.conf").read_text()
         self.assertIn("[update_manager flook32]", moon)
         self.assertIn("flook32-ad5x-plugin.git", moon)
+        self.assertIn("channel: dev", moon)
 
     def test_failed_driver_rolls_back(self):
         self.driver.write_text("#!/bin/sh\nexit 7\n", encoding="utf-8")
