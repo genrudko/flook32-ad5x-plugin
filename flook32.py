@@ -161,6 +161,7 @@
 import socket                   # UDP/TCP сокеты для связи с FLOOK32
 import time                     # Таймеры, задержки, метки времени
 import threading                # Параллельные потоки: UDP слушатель, WebSocket
+import queue                    # Serialised, off-reactor heater transport
 import logging                  # Логирование в klippy.log (основной лог Klipper)
 import json                     # Парсинг JSON ответов от FLOOK32 API
 import select                   # Неблокирующий опрос UDP сокета (select/poll)
@@ -1765,8 +1766,8 @@ class FLOOK32Sensor:
             gcmd.respond_info("Воздух: {:.1f}°C, Нагреватель: {:.1f}°C".format(
                 self.air_temp, self.heater_temp))
 
-    def set_target_temperature(self, temp):
-        """Set FLOOK32 target and keep Klipper-side state in sync."""
+    def set_target_temperature(self, temp, publish=True):
+        """Send a target to ESP32. Native heater uses publish=False from its worker."""
         temp = float(temp)
         if temp < 0.0 or temp > 70.0:
             return False, "FLOOK32 target must be between 0 and 70C"
@@ -1774,16 +1775,21 @@ class FLOOK32Sensor:
             return False, "FLOOK32 is not connected"
         result = self._http_post("/api/target?value={}".format(temp))
         if result and ("OK" in result or "success" in result):
-            with self.temp_lock:
-                self.target_temp = temp
-                if temp <= 0.0:
-                    self.heater_state = False
+            if publish:
+                with self.temp_lock:
+                    self.target_temp = temp
+                    if temp <= 0.0:
+                        self.heater_state = False
             return True, None
         return False, "FLOOK32 rejected target {:.1f}C".format(temp)
 
     def cmd_FLOOK_SET(self, gcmd):
-        """FLOOK_SET S=<temperature> - set target temperature."""
+        """FLOOK_SET S=<temperature> - use reactor-safe native heater path."""
         temp = gcmd.get_float('S', 0.0)
+        if self.remote_heater is not None:
+            self.remote_heater.set_temp(temp)
+            gcmd.respond_info("FLOOK32 target requested: {}C".format(temp))
+            return
         ok, error = self.set_target_temperature(temp)
         if ok:
             gcmd.respond_info("FLOOK32 target set to {}C".format(temp))
@@ -1791,7 +1797,11 @@ class FLOOK32Sensor:
             gcmd.respond_info(error)
 
     def cmd_FLOOK_OFF(self, gcmd):
-        """FLOOK_OFF — аварийное выключение нагрева."""
+        """FLOOK_OFF — queue an immediate non-blocking OFF on native heater."""
+        if self.remote_heater is not None:
+            self.remote_heater.set_temp(0.0)
+            gcmd.respond_info("FLOOK32 OFF queued; ESP32 ACK is asynchronous")
+            return
         if not self.flook_ip:
             gcmd.respond_info("Нет подключенного устройства")
             return
@@ -2149,6 +2159,19 @@ class FLOOK32RemoteHeater:
         self.max_temp = sensor.native_heater_max_temp
         self.wait_delta = sensor.native_heater_wait_delta
 
+        # A single worker serialises heat commands. Network I/O never runs in
+        # Klipper's reactor, including when called from TURN_OFF_HEATERS.
+        self.reactor = self.printer.get_reactor()
+        self._command_queue = queue.Queue()
+        self._command_lock = threading.Lock()
+        self._generation = 0
+        self._last_command_error = ''
+        self._off_pending = False
+        self._command_worker = threading.Thread(
+            target=self._run_heater_commands, name='flook32-heater-io')
+        self._command_worker.daemon = True
+        self._command_worker.start()
+
         gcode = self.printer.lookup_object('gcode')
         gcode.register_mux_command(
             'SET_HEATER_TEMPERATURE', 'HEATER', self.name,
@@ -2188,25 +2211,79 @@ class FLOOK32RemoteHeater:
     def get_name(self):
         return self.full_name
 
+    def _run_heater_commands(self):
+        """Only this worker may send native-heater HTTP target commands."""
+        while True:
+            generation, degrees, completion = self._command_queue.get()
+            with self._command_lock:
+                obsolete = (generation != self._generation and degrees > 0.0)
+            if obsolete:
+                if completion is not None:
+                    self.reactor.async_complete(
+                        completion, (False, 'FLOOK32 heat request superseded'))
+                continue
+            started = time.monotonic()
+            try:
+                ok, error = self.sensor.set_target_temperature(
+                    degrees, publish=False)
+            except Exception as exc:
+                ok, error = False, str(exc)
+            elapsed = time.monotonic() - started
+            logging.info('FLOOK32 native heater HTTP target=%.1f, elapsed=%.3fs, ok=%s',
+                         degrees, elapsed, ok)
+            # Apply ACK only if no newer command was requested. In particular,
+            # a late ON acknowledgement must never overwrite a pending OFF.
+            with self._command_lock:
+                if generation == self._generation:
+                    self._last_command_error = '' if ok else (
+                        error or 'FLOOK32 communication failed')
+                    if ok:
+                        with self.sensor.temp_lock:
+                            self.sensor.target_temp = degrees
+                            if degrees <= 0.0:
+                                self.sensor.heater_state = False
+                    if degrees <= 0.0:
+                        self._off_pending = not ok
+                    elif ok:
+                        self._off_pending = False
+            if degrees <= 0.0 and not ok:
+                logging.error(
+                    'FLOOK32 OFF not confirmed by ESP32: %s', error)
+            if completion is not None:
+                self.reactor.async_complete(completion, (ok, error))
+
     def set_temp(self, degrees):
         degrees = float(degrees)
         if degrees and (degrees < self.min_temp or degrees > self.max_temp):
             raise self.printer.command_error(
                 'Requested FLOOK32 temperature (%.1f) out of range (%.1f:%.1f)'
                 % (degrees, self.min_temp, self.max_temp))
-        ok, error = self.sensor.set_target_temperature(degrees)
-        if not ok:
+
+        # A zero target MUST return promptly (TURN_OFF_HEATERS / shutdown).
+        # The worker sends OFF after any already in-flight ON, preserving order.
+        completion = self.reactor.completion() if degrees > 0.0 else None
+        with self._command_lock:
+            self._generation += 1
+            generation = self._generation
             if degrees <= 0.0:
-                # TURN_OFF_HEATERS must never be blocked by a disappeared
-                # network accessory.  FLOOK32 retains its own autonomous
-                # safety controller; keep Klipper target state safe and warn.
+                self._off_pending = True
                 with self.sensor.temp_lock:
-                    self.sensor.target_temp = 0.0
-                    self.sensor.heater_state = False
-                logging.warning("FLOOK32 remote shutdown could not be confirmed: %s",
-                                error)
-                return
-            raise self.printer.command_error(error)
+                    self.sensor.target_temp = 0.0  # requested, not ACKed
+        self._command_queue.put((generation, degrees, completion))
+        if completion is None:
+            return
+
+        # ReactorCompletion.wait() yields through Klipper's greenlet reactor;
+        # unlike time.sleep()/socket.recv() MCU timers continue being serviced.
+        timeout_result = (False, 'FLOOK32 heater command timed out')
+        result = completion.wait(
+            self.reactor.monotonic() + 8.0, timeout_result)
+        ok, error = result
+        if not ok:
+            # Invalidate a queued / delayed ON. The serial worker sends OFF
+            # after an in-flight command, even when the original ACK was lost.
+            self.set_temp(0.0)
+            raise self.printer.command_error(error or 'FLOOK32 command failed')
 
     def get_temp(self, eventtime):
         with self.sensor.temp_lock:
@@ -2247,6 +2324,8 @@ class FLOOK32RemoteHeater:
             'websocket_connected': bool(self.sensor.ws_connected),
             'locked': locked,
             'flook_ip': self.sensor.flook_ip or '',
+            'remote_command_error': self._last_command_error,
+            'off_pending': self._off_pending,
         }
 
     cmd_SET_HEATER_TEMPERATURE_help = 'Set FLOOK32 chamber temperature'
