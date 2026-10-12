@@ -201,8 +201,12 @@ class RemoteHeaterTests(unittest.TestCase):
         sensor.heater_state = True
         sensor.set_target_temperature = lambda temp, publish=True: (False, 'offline')
         heater.set_temp(0)
-        self.assertEqual(sensor.target_temp, 0.0)
-        self.assertFalse(sensor.heater_state)
+        self.assertEqual(sensor.target_temp, 0.0)  # requested local target
+        # OFF is unconfirmed: do not pretend the remote SSR stopped.
+        self.assertTrue(sensor.heater_state)
+        self.assertTrue(wait_until(
+            lambda: heater.get_status(0)['remote_command_error'] == 'offline'))
+        self.assertTrue(heater.get_status(0)['off_pending'])
 
     def test_failed_remote_heat_request_is_an_error(self):
         _, sensor, heater = make_heater()
