@@ -1,5 +1,6 @@
 import importlib.util
 import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -29,9 +30,26 @@ class FakeHeaters:
         self.set_calls.append((heater, temp, wait)); heater.set_temp(temp)
     def cmd_TEMPERATURE_WAIT(self, gcmd): pass
 
+class FakeCompletion:
+    def __init__(self):
+        self.event = threading.Event()
+        self.result = None
+    def complete(self, result):
+        self.result = result
+        self.event.set()
+    def wait(self, waketime, timeout_result):
+        return self.result if self.event.wait(1.0) else timeout_result
+
+class FakeReactor:
+    monotonic = staticmethod(time.monotonic)
+    def completion(self):
+        return FakeCompletion()
+    def async_complete(self, completion, result):
+        completion.complete(result)
+
 class FakePrinter:
     def __init__(self):
-        self.gcode = FakeGcode(); self.heaters = FakeHeaters(); self.objects = {}; self.handlers = {}
+        self.gcode = FakeGcode(); self.heaters = FakeHeaters(); self.objects = {}; self.handlers = {}; self.reactor = FakeReactor()
     def lookup_object(self, name):
         if name == 'gcode': return self.gcode
         if name == 'heaters': return self.heaters
@@ -47,6 +65,7 @@ class FakePrinter:
     def send_event(self, event):
         for callback in self.handlers.get(event, []): callback(0.0)
     def command_error(self, message): return RuntimeError(message)
+    def get_reactor(self): return self.reactor
 
 class FakeConfig:
     def __init__(self, printer, values=None): self.printer = printer; self.values = values or {}
@@ -69,8 +88,10 @@ class FakeSensor:
         self.native_heater_temperature_sensor = True
         self.native_heater_temperature_sensor_name = 'chamber_heater'
         self.targets = []; self.closed = False
-    def set_target_temperature(self, temp):
-        self.targets.append(float(temp)); self.target_temp = float(temp); self.heater_state = temp > 0
+    def set_target_temperature(self, temp, publish=True):
+        self.targets.append(float(temp))
+        if publish:
+            self.target_temp = float(temp); self.heater_state = temp > 0
         return True, None
     def close(self): self.closed = True
 
@@ -80,6 +101,21 @@ def make_heater(values=None):
         if 'max_temp' in values: sensor.native_heater_max_temp = float(values['max_temp'])
         if 'wait_delta' in values: sensor.native_heater_wait_delta = float(values['wait_delta'])
     return printer, sensor, flook32.FLOOK32RemoteHeater(FakeConfig(printer, values), sensor, 'chamber')
+
+def run_and_capture_error(fn):
+    try:
+        fn()
+        return None
+    except Exception as exc:
+        return str(exc)
+
+def wait_until(predicate, timeout=1.5):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return predicate()
 
 class RemoteHeaterTests(unittest.TestCase):
     def test_standard_target_command(self):
@@ -155,23 +191,77 @@ class RemoteHeaterTests(unittest.TestCase):
     def test_wait_and_turn_off(self):
         _, sensor, heater = make_heater({'wait_delta': 2}); sensor.target_temp = 45; sensor.air_temp = 40
         self.assertTrue(heater.check_busy(0)); sensor.air_temp = 43; self.assertFalse(heater.check_busy(0))
-        heater.set_temp(0); self.assertEqual(sensor.targets[-1], 0.0)
+        heater.set_temp(0)
+        self.assertTrue(wait_until(lambda: sensor.targets and sensor.targets[-1] == 0.0))
 
 
     def test_failed_remote_off_does_not_block_global_shutdown(self):
         _, sensor, heater = make_heater()
         sensor.target_temp = 45.0
         sensor.heater_state = True
-        sensor.set_target_temperature = lambda temp: (False, 'offline')
+        sensor.set_target_temperature = lambda temp, publish=True: (False, 'offline')
         heater.set_temp(0)
         self.assertEqual(sensor.target_temp, 0.0)
         self.assertFalse(sensor.heater_state)
 
     def test_failed_remote_heat_request_is_an_error(self):
         _, sensor, heater = make_heater()
-        sensor.set_target_temperature = lambda temp: (False, 'offline')
+        sensor.set_target_temperature = lambda temp, publish=True: (False, 'offline')
         with self.assertRaisesRegex(RuntimeError, 'offline'):
             heater.set_temp(45)
+
+    def test_http_runs_in_worker_thread(self):
+        _, sensor, heater = make_heater()
+        main_tid = threading.get_ident()
+        original = sensor.set_target_temperature
+        worker_ids = []
+        def slow_send(temp, publish=True):
+            worker_ids.append(threading.get_ident())
+            time.sleep(0.12)
+            return original(temp, publish)
+        sensor.set_target_temperature = slow_send
+        heater.set_temp(50)
+        self.assertTrue(worker_ids)
+        self.assertNotIn(main_tid, worker_ids)
+        self.assertEqual(heater.get_temp(0)[1], 50)
+
+    def test_off_follows_inflight_on_and_cannot_be_overwritten(self):
+        _, sensor, heater = make_heater()
+        started = threading.Event()
+        release = threading.Event()
+        original = sensor.set_target_temperature
+        def blocking_send(temp, publish=True):
+            if temp > 0:
+                started.set()
+                if not release.wait(2):
+                    raise RuntimeError('test worker stuck')
+            return original(temp, publish)
+        sensor.set_target_temperature = blocking_send
+        outcomes = []
+        pending_on = threading.Thread(
+            target=lambda: outcomes.append(
+                run_and_capture_error(lambda: heater.set_temp(50))))
+        pending_on.start()
+        self.assertTrue(started.wait(1))
+        before = time.monotonic()
+        heater.set_temp(0)
+        self.assertLess(time.monotonic() - before, 0.1)
+        self.assertEqual(heater.get_temp(0)[1], 0.0)
+        release.set()
+        pending_on.join(2)
+        self.assertFalse(pending_on.is_alive())
+        self.assertTrue(wait_until(lambda: len(sensor.targets) == 2))
+        self.assertEqual(sensor.targets, [50.0, 0.0])
+        self.assertEqual(heater.get_temp(0)[1], 0.0)
+        self.assertFalse(heater.get_status(0)['off_pending'])
+
+    def test_off_failure_is_exposed_without_blocking(self):
+        _, sensor, heater = make_heater()
+        sensor.set_target_temperature = lambda temp, publish=True: (False, 'offline')
+        heater.set_temp(0)
+        self.assertTrue(wait_until(
+            lambda: heater.get_status(0)['remote_command_error'] == 'offline'))
+        self.assertTrue(heater.get_status(0)['off_pending'])
 
     def test_existing_sensor_registers_native_heater_proxy(self):
         printer = FakePrinter(); config = FakeConfig(printer); sensor = FakeSensor()
