@@ -2222,11 +2222,15 @@ class FLOOK32RemoteHeater:
                     self.reactor.async_complete(
                         completion, (False, 'FLOOK32 heat request superseded'))
                 continue
+            started = time.monotonic()
             try:
                 ok, error = self.sensor.set_target_temperature(
                     degrees, publish=False)
             except Exception as exc:
                 ok, error = False, str(exc)
+            elapsed = time.monotonic() - started
+            logging.info('FLOOK32 native heater HTTP target=%.1f, elapsed=%.3fs, ok=%s',
+                         degrees, elapsed, ok)
             # Apply ACK only if no newer command was requested. In particular,
             # a late ON acknowledgement must never overwrite a pending OFF.
             with self._command_lock:
@@ -2240,6 +2244,8 @@ class FLOOK32RemoteHeater:
                                 self.sensor.heater_state = False
                     if degrees <= 0.0:
                         self._off_pending = not ok
+                    elif ok:
+                        self._off_pending = False
             if degrees <= 0.0 and not ok:
                 logging.error(
                     'FLOOK32 OFF not confirmed by ESP32: %s', error)
